@@ -9,6 +9,7 @@
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/Model.hpp"    // M4b: ModelObject/ModelInstance for GET /objects
+#include "libslic3r/CustomGCode.hpp" // plate/custom_gcode: per-layer pause, colour change, G-code
 #include "slic3r/GUI/NotificationManager.hpp" // in-app change notifications
 #include "libslic3r/AppConfig.hpp"             // remote_api_notify toggle
 #include "slic3r/GUI/Tab.hpp"
@@ -273,7 +274,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -1084,6 +1085,153 @@ Response Controller::handle_load_model(const std::string &body)
     return { 200, r };
 }
 
+// GET/PUT /api/v1/plate/custom_gcode - per-layer custom G-code of the CURRENT plate: pauses,
+// filament colour changes, tool changes, templates and raw G-code, i.e. what the preview's
+// layer slider "+" menu edits. POST /model loads with LoadStrategy::LoadModel, which does not
+// bring a 3MF's per-layer G-code in reliably, and the GUI slider has no remote equivalent; this
+// lets a client place e.g. an insert-a-part pause at an exact layer and read it back.
+//
+// Item: {"print_z": mm (top Z of the layer the code runs BEFORE), "type": "PausePrint" |
+//        "ColorChange" | "ToolChange" | "Template" | "Custom", "extruder": 1-based (default 1),
+//        "color": "#RRGGBB" (ColorChange), "extra": pause message / raw G-code (Custom)}
+// PUT body: {"items": [Item...], "mode": "SingleExtruder" | "MultiAsSingle" | "MultiExtruder"}
+// "items" replaces the plate's list ([] clears it). "mode" is optional: default = inferred the
+// way the preview slider does (one filament -> SingleExtruder; every volume on one extruder ->
+// MultiAsSingle; otherwise MultiExtruder). Invalidates the plate's slice result.
+namespace {
+const char *custom_gcode_type_name(CustomGCode::Type t)
+{
+    switch (t) {
+    case CustomGCode::ColorChange: return "ColorChange";
+    case CustomGCode::PausePrint:  return "PausePrint";
+    case CustomGCode::ToolChange:  return "ToolChange";
+    case CustomGCode::Template:    return "Template";
+    case CustomGCode::Custom:      return "Custom";
+    default:                       return "Unknown";
+    }
+}
+
+const char *custom_gcode_mode_name(CustomGCode::Mode m)
+{
+    switch (m) {
+    case CustomGCode::SingleExtruder: return CustomGCode::SingleExtruderMode;
+    case CustomGCode::MultiAsSingle:  return CustomGCode::MultiAsSingleMode;
+    case CustomGCode::MultiExtruder:  return CustomGCode::MultiExtruderMode;
+    default:                          return "Undef";
+    }
+}
+
+nlohmann::json custom_gcode_to_json(const CustomGCode::Info &info, int plate_idx)
+{
+    nlohmann::json items = nlohmann::json::array();
+    for (const CustomGCode::Item &it : info.gcodes)
+        items.push_back({{"print_z", it.print_z}, {"type", custom_gcode_type_name(it.type)},
+                         {"extruder", it.extruder}, {"color", it.color}, {"extra", it.extra}});
+    return {{"plate", plate_idx}, {"mode", custom_gcode_mode_name(info.mode)}, {"items", items}};
+}
+} // namespace
+
+Response Controller::handle_get_custom_gcode()
+{
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        Plater   *plater = wxGetApp().plater();
+        const int plate  = plater->get_partplate_list().get_curr_plate_index();
+        auto     &all    = plater->model().plates_custom_gcodes;
+        auto      it     = all.find(plate);
+        return custom_gcode_to_json(it == all.end() ? CustomGCode::Info{} : it->second, plate);
+    });
+    return { 200, r };
+}
+
+Response Controller::handle_put_custom_gcode(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch route
+    if (!in.is_object() || !in.contains("items") || !in["items"].is_array())
+        return { 400, {{"error", "missing_items"}, {"detail", "body must be {\"items\": [...]}"}} };
+
+    static const std::map<std::string, CustomGCode::Type> types = {
+        {"ColorChange", CustomGCode::ColorChange}, {"PausePrint", CustomGCode::PausePrint},
+        {"ToolChange", CustomGCode::ToolChange},   {"Template", CustomGCode::Template},
+        {"Custom", CustomGCode::Custom}};
+    static const std::map<std::string, CustomGCode::Mode> modes = {
+        {CustomGCode::SingleExtruderMode, CustomGCode::SingleExtruder},
+        {CustomGCode::MultiAsSingleMode, CustomGCode::MultiAsSingle},
+        {CustomGCode::MultiExtruderMode, CustomGCode::MultiExtruder}};
+
+    // Validate everything off the GUI thread; the lambda only applies.
+    std::vector<CustomGCode::Item> items;
+    for (size_t i = 0; i < in["items"].size(); ++i) {
+        const nlohmann::json &j = in["items"][i];
+        const std::string where = "items[" + std::to_string(i) + "]";
+        if (!j.is_object() || !j.contains("print_z") || !j["print_z"].is_number())
+            return { 400, {{"error", "invalid_item"}, {"detail", where + ".print_z must be a number"}}};
+        const double z = j["print_z"].get<double>();
+        if (!std::isfinite(z) || z <= 0.)
+            return { 400, {{"error", "invalid_item"}, {"detail", where + ".print_z must be > 0"}}};
+        const std::string type = j.value("type", std::string("PausePrint"));
+        auto t = types.find(type);
+        if (t == types.end())
+            return { 400, {{"error", "invalid_item"},
+                           {"detail", where + ".type must be PausePrint, ColorChange, ToolChange, Template or Custom"}}};
+        const int extruder = j.value("extruder", 1);
+        if (extruder < 1)
+            return { 400, {{"error", "invalid_item"}, {"detail", where + ".extruder is 1-based"}}};
+        CustomGCode::Item item;
+        item.print_z  = z;
+        item.type     = t->second;
+        item.extruder = extruder;
+        item.color    = j.value("color", std::string());
+        item.extra    = j.value("extra", std::string());
+        if (item.type == CustomGCode::Custom && item.extra.empty())
+            return { 400, {{"error", "invalid_item"}, {"detail", where + ": Custom needs the G-code in extra"}}};
+        items.push_back(std::move(item));
+    }
+    std::sort(items.begin(), items.end());
+
+    CustomGCode::Mode mode = CustomGCode::Undef;
+    if (in.contains("mode")) {
+        auto m = in["mode"].is_string() ? modes.find(in["mode"].get<std::string>()) : modes.end();
+        if (m == modes.end())
+            return { 400, {{"error", "invalid_mode"}, {"detail", "mode must be SingleExtruder, MultiAsSingle or MultiExtruder"}}};
+        mode = m->second;
+    }
+
+    nlohmann::json r = run_on_ui([items = std::move(items), mode]() mutable -> nlohmann::json {
+        Plater    *plater = wxGetApp().plater();
+        PartPlate *cur    = plater->get_partplate_list().get_curr_plate();
+        const int  plate  = plater->get_partplate_list().get_curr_plate_index();
+        if (mode == CustomGCode::Undef) {
+            // Same rule as the preview slider (Preview::update_layers_slider_mode).
+            std::set<int> used;
+            for (const ModelObject *mo : plater->model().objects)
+                for (const ModelVolume *mv : mo->volumes)
+                    if (mv->is_model_part()) {
+                        int e = mv->extruder_id();
+                        if (e <= 0) {
+                            const ConfigOption *oe = mo->config.option("extruder");
+                            e = oe != nullptr ? oe->getInt() : 1;
+                        }
+                        used.insert(std::max(e, 1));
+                    }
+            const size_t filaments = wxGetApp().preset_bundle->filament_presets.size();
+            mode = filaments <= 1   ? CustomGCode::SingleExtruder :
+                   used.size() <= 1 ? CustomGCode::MultiAsSingle : CustomGCode::MultiExtruder;
+        }
+        CustomGCode::Info &info = plater->model().plates_custom_gcodes[plate];
+        info.mode   = mode;
+        info.gcodes = std::move(items);
+        if (cur != nullptr)
+            cur->update_slice_result_valid_state(false);
+        return custom_gcode_to_json(info, plate);
+    });
+    if (r.contains("error"))
+        return { 500, r };
+    const size_t n = r["items"].size();
+    api_notify(n == 0 ? std::string("Cleared per-layer G-code on this plate")
+                      : "Set " + std::to_string(n) + " per-layer G-code item(s) on this plate");
+    return { 200, r };
+}
+
 // M4a: PUT /api/v1/preset  body {"type":"print|filament|printer","name":"..."}
 Response Controller::handle_select_preset(const std::string &body)
 {
@@ -1829,6 +1977,14 @@ Response Controller::dispatch(const Request &req)
         if (is("GET",  "/api/v1/gcode"))        return handle_get_gcode();
         if (is("GET",  "/api/v1/objects"))      return handle_get_objects();
         if (is("GET",  "/api/v1/plate/render")) return handle_plate_render(t);
+        if (is("GET",  "/api/v1/plate/custom_gcode")) return handle_get_custom_gcode();
+        if (is("PUT",  "/api/v1/plate/custom_gcode")) {
+            try {
+                return handle_put_custom_gcode(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
         if (is("GET",  "/api/v1/presets"))      return handle_get_presets();
         if (is("POST", "/api/v1/arrange"))      return handle_arrange();
         if (is("POST", "/api/v1/orient"))       return handle_orient();
