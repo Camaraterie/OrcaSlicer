@@ -7,6 +7,7 @@
 #include <string>
 #include <memory>
 #include <chrono>
+#include <set>
 #include <unordered_set>
 #include <boost/thread.hpp>
 #include <boost/nowide/fstream.hpp>
@@ -404,6 +405,31 @@ public:
     int     print_error;
     static std::string get_error_code_str(int error_code);
     std::string get_print_error_str() const { return MachineObject::get_error_code_str(this->print_error); }
+
+    /* Remote API error latch. The firmware resets print_error and hms when a job is
+       stopped while the printer screen still shows the error dialog, and nothing in
+       the report says whether that dialog is open. Keep the last error until a new
+       job starts or a client acknowledges it (Orca-side only, nothing is sent). */
+    struct ApiErrorLatch {
+        bool active = false;
+        int  print_error = 0;
+        std::vector<std::pair<std::string, int>> hms; /* long code, HMSMessageLevel */
+        std::string gcode_state;
+        int         layer = 0;
+        std::string subtask_name;
+        std::chrono::system_clock::time_point first_seen, last_seen, cleared_at;
+        std::string cleared_by; /* "", "ack" or "new_job" */
+    };
+    ApiErrorLatch         api_error_latch;
+    std::string           api_tray_now;
+    std::string           api_tray_tar;
+    void update_api_error_latch();
+    void ack_api_error_latch();
+private:
+    int                   m_api_prev_print_error = 0;
+    std::set<std::string> m_api_prev_hms;
+    std::string           m_api_prev_state;
+public:
 
     std::unordered_set<GUI::DeviceErrorDialog*> m_command_error_code_dlgs;
     void  add_command_error_code_dlg(int command_err, json action_json=json{});

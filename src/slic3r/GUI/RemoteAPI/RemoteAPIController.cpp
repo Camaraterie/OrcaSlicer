@@ -26,6 +26,10 @@
 #include <miniz.h>                        // plate_render: RGBA -> PNG in memory
 #include "libslic3r/FlushVolCalc.hpp"      // project scope: g_max_flush_volume bound
 #include "slic3r/GUI/WipeTowerDialog.hpp"  // project scope: is_flush_config_modified
+#include "slic3r/GUI/DeviceManager.hpp"        // device/status: MachineObject
+#include "slic3r/GUI/DeviceCore/DevManager.h"   // device/status: selected machine
+#include "slic3r/GUI/DeviceCore/DevHMS.h"       // device/status: HMS items
+#include <ctime>
 
 #include <algorithm>
 #include <cmath>
@@ -274,7 +278,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode", "device_status"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -1985,6 +1989,131 @@ Response Controller::handle_jobs_status()
     return { 200, r };
 }
 
+// ---- device status (read-only; nothing here publishes to the printer) ----
+
+static MachineObject *api_find_machine(const std::string &target)
+{
+    DeviceManager *dm = wxGetApp().getDeviceManager();
+    if (!dm) return nullptr;
+    auto qpos = target.find("dev_id=");
+    if (qpos != std::string::npos) {
+        std::string id = url_decode(target.substr(qpos + 7));
+        id = id.substr(0, id.find('&'));
+        return dm->get_my_machine(id);
+    }
+    return dm->get_selected_machine();
+}
+
+static nlohmann::json api_time(const std::chrono::system_clock::time_point &tp)
+{
+    if (tp.time_since_epoch().count() == 0) return nullptr;
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm     tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
+
+static const char *api_hms_level(int level)
+{
+    switch (level) {
+    case HMS_FATAL:   return "fatal";
+    case HMS_SERIOUS: return "serious";
+    case HMS_COMMON:  return "common";
+    case HMS_INFO:    return "info";
+    default:          return "unknown";
+    }
+}
+
+static nlohmann::json api_print_error(MachineObject *obj, int code)
+{
+    if (code <= 0) return {{"code", 0}, {"str", ""}, {"text", ""}};
+    return {{"code", code},
+            {"str", MachineObject::get_error_code_str(code)},
+            {"text", wxGetApp().get_hms_query()->query_print_error_msg(obj, code).ToUTF8().data()}};
+}
+
+static nlohmann::json api_hms_item(MachineObject *obj, const std::string &long_code, int level)
+{
+    return {{"long_code", long_code},
+            {"level", api_hms_level(level)},
+            {"text", wxGetApp().get_hms_query()->query_hms_msg(obj, long_code).ToUTF8().data()}};
+}
+
+static nlohmann::json api_last_error(MachineObject *obj)
+{
+    const MachineObject::ApiErrorLatch &l = obj->api_error_latch;
+    nlohmann::json hms = nlohmann::json::array();
+    for (const auto &h : l.hms) hms.push_back(api_hms_item(obj, h.first, h.second));
+    return {{"active", l.active},
+            {"print_error", api_print_error(obj, l.print_error)},
+            {"hms", hms},
+            {"gcode_state", l.gcode_state},
+            {"layer", l.layer},
+            {"subtask_name", l.subtask_name},
+            {"first_seen", api_time(l.first_seen)},
+            {"last_seen", api_time(l.last_seen)},
+            {"cleared_at", api_time(l.cleared_at)},
+            {"cleared_by", l.cleared_by}};
+}
+
+Response Controller::handle_device_status(const std::string &target)
+{
+    nlohmann::json r = run_on_ui([target]() -> nlohmann::json {
+        MachineObject *obj = api_find_machine(target);
+        if (!obj) return {{"error", "no_printer"}};
+
+        nlohmann::json hms = nlohmann::json::array();
+        for (const DevHMSItem &item : obj->GetHMS()->GetHMSItems())
+            hms.push_back(api_hms_item(obj, item.get_long_error_code(), (int) item.get_level()));
+
+        const bool has_data = obj->last_update_time.time_since_epoch().count() != 0;
+        const auto age      = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now() - obj->last_update_time).count();
+        return {
+            {"dev_name", obj->get_dev_name()},
+            {"printer_type", obj->printer_type},
+            {"connection", obj->connection_type()},
+            {"connected", obj->is_connected()},
+            {"last_update_age_s", has_data ? nlohmann::json(age) : nlohmann::json(nullptr)},
+            {"gcode_state", obj->print_status},
+            {"stage", obj->get_curr_stage().ToUTF8().data()},
+            {"mc_percent", obj->mc_print_percent},
+            {"layer_num", obj->curr_layer},
+            {"total_layer_num", obj->total_layers},
+            {"subtask_name", obj->subtask_name},
+            {"print_error", api_print_error(obj, obj->print_error)},
+            {"hms", hms},
+            {"ams", {{"tray_now", obj->api_tray_now},
+                     {"tray_tar", obj->api_tray_tar},
+                     {"ams_status_main", (int) obj->ams_status_main},
+                     {"ams_status_sub", obj->ams_status_sub}}},
+            {"last_error", api_last_error(obj)}};
+    });
+    if (r.contains("error")) return { 404, r };
+    return { 200, r };
+}
+
+Response Controller::handle_device_ack_error(const std::string &target)
+{
+    // Resets Orca's latch only. The printer screen dialog is untouched: closing it
+    // (uiop / clean_print_error) is a printer command and is deliberately not offered.
+    nlohmann::json r = run_on_ui([target]() -> nlohmann::json {
+        MachineObject *obj = api_find_machine(target);
+        if (!obj) return {{"error", "no_printer"}};
+        const bool was_active = obj->api_error_latch.active;
+        obj->ack_api_error_latch();
+        return {{"acknowledged", was_active}, {"last_error", api_last_error(obj)}};
+    });
+    if (r.contains("error")) return { 404, r };
+    return { 200, r };
+}
+
 Response Controller::dispatch(const Request &req)
 {
     try {
@@ -2058,6 +2187,8 @@ Response Controller::dispatch(const Request &req)
         if (is("POST", "/api/v1/arrange"))      return handle_arrange();
         if (is("POST", "/api/v1/orient"))       return handle_orient();
         if (is("GET",  "/api/v1/jobs/status"))  return handle_jobs_status();
+        if (is("GET",  "/api/v1/device/status"))    return handle_device_status(t);
+        if (is("POST", "/api/v1/device/ack_error")) return handle_device_ack_error(t);
         {
             // M4b object sub-routes: /api/v1/objects/<id> and /api/v1/objects/<id>/<action>
             static const std::string pfx = "/api/v1/objects/";

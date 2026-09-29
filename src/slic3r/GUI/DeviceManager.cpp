@@ -11,6 +11,7 @@
 #include "Plater.hpp"
 #include "GUI_App.hpp"
 #include "ReleaseNote.hpp"
+#include <algorithm>
 #include <thread>
 #include <mutex>
 #include <codecvt>
@@ -3781,6 +3782,15 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
                     try {
                         parse_new_info(jj);
                     } catch (...) {}
+
+                    /* Remote API: raw AMS slot now/target and the error latch */
+                    if (jj.contains("ams") && jj["ams"].is_object()) {
+                        if (jj["ams"].contains("tray_now") && jj["ams"]["tray_now"].is_string())
+                            api_tray_now = jj["ams"]["tray_now"].get<std::string>();
+                        if (jj["ams"].contains("tray_tar") && jj["ams"]["tray_tar"].is_string())
+                            api_tray_tar = jj["ams"]["tray_tar"].get<std::string>();
+                    }
+                    if (!key_field_only) { update_api_error_latch(); }
 #pragma endregion
                 } else if (jj["command"].get<std::string>() == "gcode_line") {
                     //ack of gcode_line
@@ -5509,6 +5519,73 @@ std::string MachineObject::get_error_code_str(int error_code)
     std::string print_error_str = std::string(buf);
     if (print_error_str.size() > 4) { print_error_str.insert(4, "-"); }
     return print_error_str;
+}
+
+void MachineObject::update_api_error_latch()
+{
+    const auto now = std::chrono::system_clock::now();
+
+    /* HMS info-level items are notices, not errors: report them, do not latch them */
+    std::set<std::string>                    hms_now;
+    std::vector<std::pair<std::string, int>> hms_errors;
+    for (const DevHMSItem &item : m_hms_system->GetHMSItems()) {
+        const std::string code = item.get_long_error_code();
+        hms_now.insert(code);
+        if (item.get_level() != HMS_INFO) { hms_errors.emplace_back(code, (int) item.get_level()); }
+    }
+
+    /* A new job ends the previous job's latch */
+    const bool job_start = (print_status == "PREPARE" || print_status == "RUNNING") &&
+                           (m_api_prev_state == "FINISH" || m_api_prev_state == "FAILED" || m_api_prev_state == "IDLE");
+    if (job_start && api_error_latch.active) {
+        api_error_latch.active     = false;
+        api_error_latch.cleared_at = now;
+        api_error_latch.cleared_by = "new_job";
+    }
+
+    /* Latch on transitions only, so an acknowledged error that is still reported does not re-latch */
+    bool new_print_error = print_error > 0 && print_error != m_api_prev_print_error &&
+                           !GUI::wxGetApp().get_hms_query()->is_internal_error(this, print_error);
+    bool new_hms = false;
+    for (const auto &e : hms_errors) {
+        if (m_api_prev_hms.count(e.first) == 0) { new_hms = true; }
+    }
+
+    ApiErrorLatch &l = api_error_latch;
+    if (new_print_error || new_hms) {
+        if (!l.active) {
+            l            = ApiErrorLatch();
+            l.active     = true;
+            l.first_seen = now;
+        }
+        if (new_print_error) { l.print_error = print_error; }
+        for (const auto &e : hms_errors) {
+            auto it = std::find_if(l.hms.begin(), l.hms.end(), [&e](const auto &h) { return h.first == e.first; });
+            if (it == l.hms.end()) { l.hms.push_back(e); }
+        }
+        l.gcode_state  = print_status;
+        l.layer        = curr_layer;
+        l.subtask_name = subtask_name;
+    }
+    if (l.active) {
+        bool still_reported = l.print_error > 0 && print_error == l.print_error;
+        for (const auto &h : l.hms) {
+            if (hms_now.count(h.first)) { still_reported = true; }
+        }
+        if (still_reported) { l.last_seen = now; }
+    }
+
+    m_api_prev_print_error = print_error;
+    m_api_prev_hms         = std::move(hms_now);
+    m_api_prev_state       = print_status;
+}
+
+void MachineObject::ack_api_error_latch()
+{
+    if (!api_error_latch.active) { return; }
+    api_error_latch.active     = false;
+    api_error_latch.cleared_at = std::chrono::system_clock::now();
+    api_error_latch.cleared_by = "ack";
 }
 
 void MachineObject::add_command_error_code_dlg(int command_err, json action_json)

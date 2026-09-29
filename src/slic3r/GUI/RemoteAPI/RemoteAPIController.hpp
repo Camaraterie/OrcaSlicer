@@ -76,6 +76,8 @@ private:
     Response handle_arrange();                              // M4b: POST /arrange (async)
     Response handle_orient();                               // M4b: POST /orient (async)
     Response handle_jobs_status();                          // M4b: GET /jobs/status
+    Response handle_device_status(const std::string &target);    // GET /device/status (read-only)
+    Response handle_device_ack_error(const std::string &target); // POST /device/ack_error (Orca-side latch only)
 
     // Mutate m_slice under the lock and broadcast a snapshot (event_name) to WS clients.
     void set_slice_state(const std::function<void(SliceState&)> &mut, const char *event_name);
