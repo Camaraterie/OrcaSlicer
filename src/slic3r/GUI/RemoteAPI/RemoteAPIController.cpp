@@ -278,7 +278,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode", "device_status"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode", "device_status", "filaments"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -1305,6 +1305,109 @@ Response Controller::handle_put_custom_gcode(const std::string &body)
     return { 200, r };
 }
 
+// ---- per-slot filament presets (the sidebar filament combo boxes) ----
+
+static nlohmann::json filament_slots_json()
+{
+    PresetBundle *bundle  = wxGetApp().preset_bundle;
+    const auto   *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    nlohmann::json slots  = nlohmann::json::array();
+    for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
+        const std::string &name   = bundle->filament_presets[i];
+        const Preset      *preset = bundle->filaments.find_preset(name, false, true);
+        std::string        type;
+        if (preset != nullptr) {
+            const auto *t = preset->config.option<ConfigOptionStrings>("filament_type");
+            if (t != nullptr && !t->values.empty()) type = t->values.front();
+        }
+        slots.push_back({{"slot", i + 1},
+                         {"preset", name},
+                         {"type", type},
+                         {"colour", colours != nullptr && i < colours->values.size() ? colours->values[i] : ""},
+                         {"exists", preset != nullptr},
+                         {"compatible", preset != nullptr && preset->is_compatible}});
+    }
+    return {{"printer", bundle->printers.get_selected_preset_name()}, {"slots", slots}};
+}
+
+Response Controller::handle_get_filaments()
+{
+    return { 200, run_on_ui([]() -> nlohmann::json { return filament_slots_json(); }) };
+}
+
+// PUT /api/v1/filaments  body {"presets": {"1": "<preset name>", "3": "<preset name>"}}
+// Slots are 1-based; slots not named keep their preset. The slot count never changes
+// and colours are left alone (they are project config: PUT /config filament_colour).
+// All names are validated before anything changes, so a failed PUT changes nothing.
+Response Controller::handle_put_filaments(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch route
+    if (!in.is_object() || !in.contains("presets") || !in["presets"].is_object() || in["presets"].empty())
+        return { 400, {{"error", "missing_fields"}, {"detail", "body must be {\"presets\": {\"<slot>\": \"<name>\"}}"}} };
+    std::map<size_t, std::string> wanted;
+    for (auto it = in["presets"].begin(); it != in["presets"].end(); ++it) {
+        size_t slot = 0;
+        try { slot = std::stoul(it.key()); } catch (...) {}
+        if (slot == 0 || !it.value().is_string())
+            return { 400, {{"error", "bad_slot"}, {"slot", it.key()}} };
+        wanted[slot] = it.value().get<std::string>();
+    }
+
+    nlohmann::json r = run_on_ui([wanted]() -> nlohmann::json {
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        Plater       *plater = wxGetApp().plater();
+        const size_t  count  = bundle->filament_presets.size();
+        nlohmann::json problems = nlohmann::json::array();
+        for (const auto &w : wanted) {
+            const Preset *preset = bundle->filaments.find_preset(w.second, false, true);
+            if (w.first > count)
+                problems.push_back({{"slot", w.first}, {"error", "slot_out_of_range"}, {"slots", count}});
+            else if (preset == nullptr)
+                problems.push_back({{"slot", w.first}, {"error", "unknown_preset"}, {"preset", w.second}});
+            else if (!preset->is_compatible)
+                problems.push_back({{"slot", w.first}, {"error", "incompatible_preset"}, {"preset", w.second},
+                                    {"printer", bundle->printers.get_selected_preset_name()}});
+        }
+        if (!problems.empty()) return {{"error", "invalid_presets"}, {"problems", problems}};
+        if (!plater->get_ui_job_worker().is_idle()) return {{"busy", true}};
+
+        // Same steps as Plater::priv::on_select_preset for a filament combo box.
+        nlohmann::json changed = nlohmann::json::array();
+        for (const auto &w : wanted) {
+            const size_t idx = w.first - 1;
+            if (bundle->filament_presets[idx] == w.second) continue;
+            bundle->set_filament_preset(idx, w.second);
+            plater->on_filament_change(idx);
+            changed.push_back(w.first);
+        }
+        if (!changed.empty()) {
+            if (count == 1) {
+                // Single filament: the sidebar goes through the filament tab instead.
+                if (bundle->filaments.current_is_dirty()) bundle->filaments.discard_current_changes();
+                if (Tab *tab = wxGetApp().get_tab(Preset::TYPE_FILAMENT))
+                    tab->select_preset(bundle->filament_presets[0], false, "", /*force_select=*/true, /*force_no_transfer=*/true);
+            }
+            plater->update_project_dirty_from_presets();
+            bundle->export_selections(*wxGetApp().app_config);
+            plater->sidebar().update_dynamic_filament_list();
+            plater->sidebar().update_presets(Preset::TYPE_FILAMENT);
+            plater->get_partplate_list().invalid_all_slice_result();
+            plater->on_config_change(bundle->full_config());
+        }
+        nlohmann::json out = filament_slots_json();
+        out["changed"] = changed;
+        return out;
+    });
+    if (r.contains("error")) {
+        api_notify("Filament presets not changed: invalid slot or preset", true);
+        return { 422, r };
+    }
+    if (r.value("busy", false)) return { 409, {{"error", "job_running"}} };
+    if (!r["changed"].empty())
+        api_notify("Set filament presets for slot(s) " + r["changed"].dump());
+    return { 200, r };
+}
+
 // M4a: PUT /api/v1/preset  body {"type":"print|filament|printer","name":"..."}
 Response Controller::handle_select_preset(const std::string &body)
 {
@@ -2184,6 +2287,14 @@ Response Controller::dispatch(const Request &req)
             }
         }
         if (is("GET",  "/api/v1/presets"))      return handle_get_presets();
+        if (is("GET",  "/api/v1/filaments"))    return handle_get_filaments();
+        if (is("PUT",  "/api/v1/filaments")) {
+            try {
+                return handle_put_filaments(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
         if (is("POST", "/api/v1/arrange"))      return handle_arrange();
         if (is("POST", "/api/v1/orient"))       return handle_orient();
         if (is("GET",  "/api/v1/jobs/status"))  return handle_jobs_status();
