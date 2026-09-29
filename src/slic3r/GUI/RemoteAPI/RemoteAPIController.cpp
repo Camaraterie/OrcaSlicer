@@ -840,6 +840,75 @@ void Controller::bind_plater_events()
                                     {"message", "A G-code path goes beyond the plate boundaries."},
                                     {"code", "TOOLPATH_OUTSIDE"}});
 
+            // Retraction load per filament. Many tiny same-filament islands (small text, QR
+            // modules) retract once per island and feed less than one retraction length in
+            // between, so the same filament is dragged back through the drive gears again and
+            // again: it gets chewed, prints string, and the AMS can fail to unload it
+            // (HMS 0700-7000-0002-0004). A card coupon did exactly this: one filament retracted
+            // 2x the length it printed. Deterministic, from the processed moves; unretracts
+            // are not counted as feed.
+            {
+                struct RetractLoad { int events = 0, rework = 0; double retracted = 0.0,
+                                     extruded = 0.0, fed_since = 1e9; bool in_retract = false; };
+                std::map<int, RetractLoad> load;
+                for (const auto &mv : res->moves) {
+                    const bool back = mv.delta_extruder < 0.f &&
+                        (mv.type == EMoveType::Retract || mv.type == EMoveType::Wipe);
+                    if (back) {
+                        RetractLoad &r = load[mv.extruder_id];
+                        if (!r.in_retract) {
+                            r.in_retract = true;
+                            ++r.events;
+                            const double len = plates.get_current_fff_print().config()
+                                                   .retraction_length.get_at(mv.extruder_id);
+                            if (r.fed_since < len) ++r.rework;
+                        }
+                        r.retracted += -mv.delta_extruder;
+                    } else if (mv.type == EMoveType::Extrude && mv.delta_extruder > 0.f) {
+                        RetractLoad &r = load[mv.extruder_id];
+                        if (r.in_retract) { r.in_retract = false; r.fed_since = 0.0; }
+                        r.fed_since += mv.delta_extruder;
+                        r.extruded  += mv.delta_extruder;
+                    }
+                }
+                // Limits: provisional, set just under the failed coupon's numbers; tune with prints.
+                constexpr double kMinExtruded = 50.0, kEventsPer100 = 25.0, kRatio = 0.25,
+                                 kRework = 0.5;
+                nlohmann::json per = nlohmann::json::object();
+                std::vector<std::string> worst;
+                for (const auto &[ext, r] : load) {
+                    const double ex = std::max(r.extruded, 1e-9);
+                    const double per100 = 100.0 * r.events / ex, ratio = r.retracted / ex,
+                                 rework = r.events ? double(r.rework) / r.events : 0.0;
+                    per[std::to_string(ext + 1)] = {
+                        {"events", r.events}, {"retracted_mm", r.retracted},
+                        {"extruded_mm", r.extruded}, {"events_per_100mm", per100},
+                        {"retract_to_extrude", ratio}, {"rework_fraction", rework}};
+                    if (r.extruded >= kMinExtruded &&
+                        (per100 > kEventsPer100 || ratio > kRatio || rework > kRework)) {
+                        char buf[200];
+                        snprintf(buf, sizeof(buf),
+                                 "Filament %d: %d retractions (%.0f per 100 mm), retracts %.0f%% of "
+                                 "what it extrudes, %.0f%% before the last retraction was fed through",
+                                 ext + 1, r.events, per100, 100.0 * ratio, 100.0 * rework);
+                        worst.emplace_back(buf);
+                    }
+                }
+                stats["retraction"] = per;
+                if (!worst.empty()) {
+                    std::string msg = "High retraction load - filament may be chewed and the AMS "
+                                      "may fail to unload. ";
+                    for (size_t i = 0; i < worst.size(); ++i)
+                        msg += (i ? "; " : "") + worst[i];
+                    msg += ". Fewer/larger islands, thicker layers or lines, a shorter retraction, "
+                           "or a longer minimum travel reduce it.";
+                    warnings.push_back({{"level", 2}, {"message", msg}, {"code", "RETRACTION_LOAD"}});
+                    wxGetApp().plater()->get_notification_manager()->push_notification(
+                        NotificationType::CustomNotification,
+                        NotificationManager::NotificationLevel::WarningNotificationLevel, msg);
+                }
+            }
+
             // F14: per-feature (extrusion-role) breakdown for the slice-analytics MCP.
             // PrintEstimatedStatistics has no per-role TIME, so sum it per role from the
             // moves (Normal mode, index 0 - matches estimated_time_seconds). Filament comes
