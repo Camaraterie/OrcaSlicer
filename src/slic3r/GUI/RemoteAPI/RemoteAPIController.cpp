@@ -1327,7 +1327,13 @@ static nlohmann::json filament_slots_json()
                          {"exists", preset != nullptr},
                          {"compatible", preset != nullptr && preset->is_compatible}});
     }
-    return {{"printer", bundle->printers.get_selected_preset_name()}, {"slots", slots}};
+    // filament_settings_id as the slicer will write it (what /config and the G-code header show)
+    nlohmann::json settings_ids = nlohmann::json::array();
+    const DynamicPrintConfig full = bundle->full_config();
+    if (const auto *ids = full.option<ConfigOptionStrings>("filament_settings_id"))
+        settings_ids = ids->values;
+    return {{"printer", bundle->printers.get_selected_preset_name()}, {"slots", slots},
+            {"filament_settings_id", settings_ids}};
 }
 
 Response Controller::handle_get_filaments()
@@ -1336,16 +1342,18 @@ Response Controller::handle_get_filaments()
 }
 
 // PUT /api/v1/filaments  body {"presets": {"1": "<preset name>", "3": "<preset name>"}}
+// or the bare map {"1": "<preset name>", ...}
 // Slots are 1-based; slots not named keep their preset. The slot count never changes
 // and colours are left alone (they are project config: PUT /config filament_colour).
 // All names are validated before anything changes, so a failed PUT changes nothing.
 Response Controller::handle_put_filaments(const std::string &body)
 {
     nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch route
-    if (!in.is_object() || !in.contains("presets") || !in["presets"].is_object() || in["presets"].empty())
-        return { 400, {{"error", "missing_fields"}, {"detail", "body must be {\"presets\": {\"<slot>\": \"<name>\"}}"}} };
+    if (in.is_object() && in.contains("presets")) in = in["presets"];
+    if (!in.is_object() || in.empty())
+        return { 400, {{"error", "missing_fields"}, {"detail", "body must be {\"<slot>\": \"<name>\"} or {\"presets\": {...}}"}} };
     std::map<size_t, std::string> wanted;
-    for (auto it = in["presets"].begin(); it != in["presets"].end(); ++it) {
+    for (auto it = in.begin(); it != in.end(); ++it) {
         size_t slot = 0;
         try { slot = std::stoul(it.key()); } catch (...) {}
         if (slot == 0 || !it.value().is_string())
