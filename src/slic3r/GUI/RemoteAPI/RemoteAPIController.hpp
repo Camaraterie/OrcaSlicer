@@ -62,6 +62,7 @@ private:
     Response handle_get_presets();                          // GET /presets
     Response handle_get_filaments();                        // GET /filaments (per slot)
     Response handle_put_filaments(const std::string &body); // PUT /filaments (per-slot presets)
+    Response handle_sync_filaments_from_ams(const std::string &body); // POST /filaments/sync_from_ams
     Response handle_get_preset_config(const std::string &body); // POST /preset/config (read named preset)
     Response handle_delete_preset(const std::string &body);      // DELETE /preset
     Response handle_put_layer_height(uint64_t id, const std::string &body);  // M4c: PUT /objects/{id}/layer_height

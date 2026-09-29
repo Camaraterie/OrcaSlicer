@@ -278,7 +278,7 @@ Response Controller::handle_status()
             {"app", SLIC3R_APP_NAME},
             {"app_version", SoftFever_VERSION},
             {"api_version", "1.0"},
-            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode", "device_status", "filaments"}},
+            {"capabilities", {"status", "config", "slice", "events", "model", "preset", "gcode", "objects", "arrange", "orient", "object_config", "slice_breakdown", "plate_render", "custom_gcode", "device_status", "filaments", "filaments_sync_from_ams"}},
             {"project", plater->get_project_filename().ToUTF8().data()},
             {"objects", objects},
             {"presets", {
@@ -1408,6 +1408,73 @@ Response Controller::handle_put_filaments(const std::string &body)
     return { 200, r };
 }
 
+// POST /api/v1/filaments/sync_from_ams  body {"mode": "overwrite"} (optional)
+// The sidebar's "Synchronize filament list from AMS" with "Overwriting" + "Synchronize now",
+// without dialogs: Sidebar::apply_ams_sync(silent). "append" needs the dialog's
+// object-to-tray mapping page, so it is not offered.
+Response Controller::handle_sync_filaments_from_ams(const std::string &body)
+{
+    std::string mode = "overwrite";
+    if (!body.empty()) {
+        nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch route
+        if (in.is_object() && in.contains("mode")) {
+            if (!in["mode"].is_string()) return { 400, {{"error", "bad_mode"}} };
+            mode = in["mode"].get<std::string>();
+        }
+    }
+    if (mode == "append")
+        return { 400, {{"error", "unsupported_mode"},
+                       {"detail", "append uses the sync dialog's object-to-tray mapping; only overwrite is available"}} };
+    if (mode != "overwrite")
+        return { 400, {{"error", "bad_mode"}, {"detail", "mode must be overwrite"}} };
+
+    nlohmann::json r = run_on_ui([]() -> nlohmann::json {
+        PresetBundle  *bundle = wxGetApp().preset_bundle;
+        Plater        *plater = wxGetApp().plater();
+        DeviceManager *dm     = wxGetApp().getDeviceManager();
+        MachineObject *obj    = dm ? dm->get_selected_machine() : nullptr;
+        if (obj == nullptr) return {{"error", "no_printer"}};
+        if (!obj->is_connected()) return {{"error", "printer_not_connected"}};
+        if (!plater->get_ui_job_worker().is_idle()) return {{"busy", true}};
+        if (!plater->is_same_printer_for_connected_and_selected(false))
+            return {{"error", "printer_mismatch"},
+                    {"detail", "the selected printer preset does not match the connected printer"}};
+
+        Sidebar &sidebar = plater->sidebar();
+        sidebar.load_ams_list(obj);
+        auto &list = bundle->filament_ams_list;
+        bool  any  = false;
+        for (auto &cur : list)
+            if (!cur.second.opt_string("filament_type", 0u).empty() || cur.second.opt_bool("filament_exist", 0u)) any = true;
+        if (!any) return {{"error", "no_filament_in_ams"}};
+
+        // apply_ams_sync reselects the filament tab's preset; a dirty one would open the
+        // modal UnsavedChangesDialog, which has no remote way to dismiss it.
+        if (bundle->filaments.current_is_dirty()) bundle->filaments.discard_current_changes();
+
+        std::string  unknowns;
+        unsigned int n = sidebar.apply_ams_sync(/*direct_sync=*/true, {}, /*all_changed=*/true,
+                                                /*enable_append=*/false, /*silent=*/true, &unknowns);
+        if (n == 0) return {{"error", "no_compatible_filaments"}, {"detail", unknowns}};
+
+        plater->get_partplate_list().invalid_all_slice_result();
+        plater->on_config_change(bundle->full_config());
+        nlohmann::json out = filament_slots_json();
+        out["synced"]     = n;
+        out["color_only"] = wxGetApp().app_config->get("sync_ams_filament_mode") == "1";
+        out["unknowns"]   = unknowns;
+        return out;
+    });
+    if (r.value("busy", false)) return { 409, {{"error", "job_running"}} };
+    if (r.contains("error")) {
+        const std::string e = r["error"].get<std::string>();
+        api_notify("AMS filament sync failed: " + e, true);
+        return { e == "no_printer" || e == "printer_not_connected" ? 503 : 422, r };
+    }
+    api_notify("Synchronized " + std::to_string(r["synced"].get<unsigned int>()) + " filament(s) from AMS");
+    return { 200, r };
+}
+
 // M4a: PUT /api/v1/preset  body {"type":"print|filament|printer","name":"..."}
 Response Controller::handle_select_preset(const std::string &body)
 {
@@ -2288,6 +2355,13 @@ Response Controller::dispatch(const Request &req)
         }
         if (is("GET",  "/api/v1/presets"))      return handle_get_presets();
         if (is("GET",  "/api/v1/filaments"))    return handle_get_filaments();
+        if (is("POST", "/api/v1/filaments/sync_from_ams")) {
+            try {
+                return handle_sync_filaments_from_ams(req.body);
+            } catch (const nlohmann::json::parse_error &) {
+                return { 400, {{"error", "invalid_json"}} };
+            }
+        }
         if (is("PUT",  "/api/v1/filaments")) {
             try {
                 return handle_put_filaments(req.body);

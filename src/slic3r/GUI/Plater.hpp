@@ -40,6 +40,8 @@ class Button;
 
 namespace Slic3r {
 
+struct AMSMapInfo;
+
 class BuildVolume;
 enum class BuildVolume_Type : char;
 class Model;
@@ -197,6 +199,8 @@ public:
     void load_ams_list(MachineObject* obj);
     std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
     void sync_ams_list(bool is_from_big_sync_btn = false);
+    unsigned int apply_ams_sync(bool direct_sync, const std::map<int, AMSMapInfo> &sync_maps, bool all_changed,
+                                bool enable_append, bool silent, std::string *unknown_detail = nullptr);
     bool sync_extruder_list();
     bool need_auto_sync_extruder_list_after_connect_priner(const MachineObject* obj);
     void update_sync_status(const MachineObject* obj);

@@ -3534,11 +3534,6 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
     if (!wxGetApp().plater()->is_same_printer_for_connected_and_selected()) {
         return;
     }
-    std::string ams_filament_ids = wxGetApp().app_config->get("ams_filament_ids", p->ams_list_device);
-    std::vector<std::string> list2;
-    if (!ams_filament_ids.empty()) {
-        boost::algorithm::split(list2, ams_filament_ids, boost::algorithm::is_any_of(","));
-    }
     wxGetApp().plater()->update_all_plate_thumbnails(true);//preview thumbnail for sync_dlg
     SyncAmsInfoDialog::SyncInfo temp_info;
     temp_info.use_dialog_pos = false;
@@ -3568,12 +3563,29 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "check error: sync_result.is_same_printer value is false";
         return;
     }
+    apply_ams_sync(sync_result.direct_sync, sync_result.sync_maps, dlg_res == wxID_YES,
+                   wxGetApp().app_config->get_bool("enable_append_color_by_sync_ams"), false);
+}
+
+// The part of sync_ams_list after the sync dialog. silent (Remote API): no dialogs;
+// unknown or incompatible trays are reported through unknown_detail instead. Returns the
+// number of synced filaments, 0 when nothing was compatible (nothing changed).
+unsigned int Sidebar::apply_ams_sync(bool direct_sync, const std::map<int, AMSMapInfo> &sync_maps_in, bool all_changed,
+                                     bool enable_append, bool silent, std::string *unknown_detail)
+{
+    auto &list = wxGetApp().preset_bundle->filament_ams_list;
+    std::string ams_filament_ids = wxGetApp().app_config->get("ams_filament_ids", p->ams_list_device);
+    std::vector<std::string> list2;
+    if (!ams_filament_ids.empty()) {
+        boost::algorithm::split(list2, ams_filament_ids, boost::algorithm::is_any_of(","));
+    }
+    std::map<int, AMSMapInfo> sync_maps = sync_maps_in; // PresetBundle::sync_ams_list takes a non-const ref
     list2.resize(list.size());
     auto iter = list.begin();
     for (int i = 0; i < list.size(); ++i, ++iter) {
         auto & ams = iter->second;
         auto filament_id = ams.opt_string("filament_id", 0u);
-        ams.set_key_value("filament_changed", new ConfigOptionBool{dlg_res == wxID_YES || list2[i] != filament_id});
+        ams.set_key_value("filament_changed", new ConfigOptionBool{all_changed || list2[i] != filament_id});
         list2[i] = filament_id;
     }
 
@@ -3588,21 +3600,22 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
     }
     MergeFilamentInfo merge_info;
     std::vector<std::pair<DynamicPrintConfig *,std::string>> unknowns;
-    auto enable_append  = wxGetApp().app_config->get_bool("enable_append_color_by_sync_ams");
     auto sync_color_only = wxGetApp().app_config->get("sync_ams_filament_mode") == "1";
-    auto n              = wxGetApp().preset_bundle->sync_ams_list(unknowns, !sync_result.direct_sync, sync_result.sync_maps, enable_append, merge_info, sync_color_only);
+    auto n              = wxGetApp().preset_bundle->sync_ams_list(unknowns, !direct_sync, sync_maps, enable_append, merge_info, sync_color_only);
     wxString detail;
     for (auto & uk : unknowns) {
         auto tray_name     = uk.first->opt_string("tray_name", 0u);
         auto filament_type = uk.first->opt_string("filament_type", 0u);
         detail += from_u8("\n- " + tray_name + "(" + filament_type + ") ") + _L(uk.second);
     }
+    if (unknown_detail) *unknown_detail = detail.ToUTF8().data();
     if (n == 0) {
+        if (silent) return 0;
         MessageDialog dlg(this,
             _L("There are no compatible filaments, and sync is not performed.") + detail,
             _L("Sync filaments with AMS"), wxOK);
         dlg.ShowModal();
-        return;
+        return 0;
     }
     // Replace unknown filament IDs with the resolved preset's filament_id
     auto &filaments        = wxGetApp().preset_bundle->filaments;
@@ -3616,7 +3629,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
     }
     ams_filament_ids = boost::algorithm::join(list2, ",");
     wxGetApp().app_config ->set("ams_filament_ids", p->ams_list_device, ams_filament_ids);
-    if (!unknowns.empty()) {
+    if (!silent && !unknowns.empty()) {
         MessageDialog dlg(this,
             _L("There are some unknown or incompatible filaments mapped to generic preset.\nPlease update Orca Slicer or restart Orca Slicer to check if there is an update to system presets.") + detail,
             _L("Sync filaments with AMS"), wxOK);
@@ -3669,7 +3682,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
     };
     { // badge ams filament
         clear_combos_filament_badge();
-        if (sync_result.direct_sync) {
+        if (direct_sync) {
             auto& ams_list = wxGetApp().preset_bundle->filament_ams_list;
             size_t tray_idx = 0;
             for (auto& entry : ams_list) {
@@ -3695,7 +3708,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
             }
         };
         std::vector<bool> sync_ams_badges;
-        for (auto iter : sync_result.sync_maps) {
+        for (auto iter : sync_maps) {
             sync_ams_badges.push_back(false);
             if (iter.second.ams_id == "" || iter.second.slot_id == "") {
                 continue;
@@ -3724,7 +3737,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
             }
         }
     } else {
-        for (auto iter : sync_result.sync_maps) {
+        for (auto iter : sync_maps) {
             if (iter.second.ams_id == "" || iter.second.slot_id == "") {
                 continue;
             }
@@ -3736,8 +3749,9 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
         }
     }
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "begin pop_finsish_sync_ams_dialog";
-    pop_finsish_sync_ams_dialog();
+    if (!silent) pop_finsish_sync_ams_dialog();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "finish pop_finsish_sync_ams_dialog";
+    return n;
 }
 
 
